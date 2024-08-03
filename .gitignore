@@ -1,0 +1,12 @@
+target/
+*.class
+*.log
+.history
+.cache
+.lib/
+
+# IntelliJ project files
+.idea
+*.iml
+out
+gen
