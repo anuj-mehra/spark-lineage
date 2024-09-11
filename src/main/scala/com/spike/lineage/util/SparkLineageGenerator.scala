@@ -1,8 +1,8 @@
 package com.spike.lineage.util
 
-import org.apache.spark.sql.{DataFrame, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LocalRelation, SerializeFromObject}
+import org.apache.spark.sql.{DataFrame, SaveMode, SparkSession}
+import org.apache.spark.sql.catalyst.expressions.{AttributeReference, Expression, NamedExpression}
+import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, Filter, Join, LocalRelation, Project, SerializeFromObject, Union}
 import org.apache.spark.sql.execution.LogicalRDD
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.datasources.LogicalRelation
@@ -53,6 +53,7 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
 
   }
 
+  // This method isused when we use df.cache or df.persist
  private def mapOneToOne(df:DataFrame, newDf: DataFrame, stepSequenceNo: String, description: String): Unit = {
    val nanoTime = System.nanoTime().toString
 
@@ -72,6 +73,7 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
    })
  }
 
+
   private def getColumns(childrenOfExpression: Seq[Expression]): Seq[String]={
     childrenOfExpression.flatMap(expression => expression.references.map(i => i.toString()))
   }
@@ -81,6 +83,12 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
 
     val df = lineageData.toSeq.toDF()
     df.show(false)
+  }
+
+  def writeLineageJson(sparkSession: SparkSession): Unit ={
+    import sparkSession.sqlContext.implicits._
+    val df = lineageData.toSeq.toDF
+    df.orderBy("nanoTime").repartition(1).write.mode(SaveMode.Overwrite).json("hdfs-path")
   }
 
   // when we are manually capturing the lineage and not being done automatically
@@ -156,6 +164,20 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
             dependentonSequenceNumbers =  Seq())
         })
       }
+      case d:Union =>
+        val columns = d.output
+        val d1 = d.output.zipWithIndex.map(i=> {
+          d.children.map(_.output(i._2))
+        })
+        columns.zip(d1).map(k=> {
+          LineageData(nanoTime = nanoTime,
+            stepSequenceNumber = stepSequenceNumber,
+            description = description,
+            columnName = s"${k._1.name}#${k._1.exprId.id}",
+            derivationLogic = "List()",
+            dependentOnColumn = k._2.map(j => (s"${j.name}#${j.exprId.id}")),
+            dependentonSequenceNumbers =  Seq())
+        })
       case d:InMemoryRelation => {
         val columns = d.output
         columns.map(i=> {
@@ -201,6 +223,22 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
             dependentonSequenceNumbers =  Seq())
         })
       }
+      case project: Project => {
+        val columns: Seq[NamedExpression] = project.projectList
+
+        columns.map(i=> {
+          val derivationLogic = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else i.children
+          val dependentOnColumn = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else getColumns(i.children)
+
+          LineageData(nanoTime = nanoTime,
+            stepSequenceNumber = stepSequenceNumber,
+            description = description,
+            columnName = s"${i.name}#${i.exprId.id}",
+            derivationLogic = s"${derivationLogic}",
+            dependentOnColumn = dependentOnColumn,
+            dependentonSequenceNumbers =  Seq())
+        })
+      }
       case d:Filter => {
         val columns = d.output
         columns.map(i=> {
@@ -216,12 +254,12 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
             dependentonSequenceNumbers =  Seq())
         })
       }
-      case aggregateInformation:Aggregate => {
+      case aggregateInformation:Aggregate =>
 
         val groupColumns = aggregateInformation.groupingExpressions.map(_.asInstanceOf[AttributeReference])
         val aggregatedColumns = aggregateInformation.aggregateExpressions
 
-          aggregatedColumns.map(i=> {
+        val d1 = groupColumns.map(i => {
           val derivationLogic = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else i.children
           val dependentOnColumn = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else getColumns(i.children)
 
@@ -233,7 +271,21 @@ class SparkLineageGenerator(sparkSession: SparkSession) {
             dependentOnColumn = dependentOnColumn,
             dependentonSequenceNumbers =  Seq())
         })
-      }
+
+        val d2 = aggregatedColumns.map(i => {
+          val derivationLogic = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else i.children
+          val dependentOnColumn = if(i.children.isEmpty) Seq(s"${i.name}#${i.exprId.id}") else getColumns(i.children)
+
+          LineageData(nanoTime = nanoTime,
+            stepSequenceNumber = stepSequenceNumber,
+            description = description,
+            columnName = s"${i.name}#${i.exprId.id}",
+            derivationLogic = s"${derivationLogic}",
+            dependentOnColumn = dependentOnColumn,
+            dependentonSequenceNumbers =  Seq())
+        })
+
+        d2
       case _ => {
         Seq(LineageData(
           nanoTime = nanoTime,
